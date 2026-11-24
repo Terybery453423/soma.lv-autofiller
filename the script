@@ -1,0 +1,1057 @@
+// ==UserScript==
+// @name         Soma Quiz Info Panel
+// @namespace    soma-quiz-info
+// @version      2.1
+// @description  Shows info about the current Soma quiz question in a minimizable, draggable window, with optional (off by default) auto-fill, auto-submit, auto-next and turbo
+// @match        https://app.soma.lv/*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // Runs inside the page context so it can hook the page's own fetch / XHR / WebSocket.
+  function main() {
+    if (window.__somaPanel) return;
+    window.__somaPanel = true;
+
+    var questions = {};   // question id -> question object
+    var order = [];       // known question ids, in quiz order
+    var currentId = null; // question currently displayed (from question_times)
+    var showLog = false;
+    var logLines = [];
+    var ui = null;
+    var autoFill = false;   // OFF at page start, never saved
+    var autoSubmit = false; // OFF at page start, never saved (only acts while autoFill is on)
+    var autoNext = false;   // OFF at page start, never saved (only acts while autoFill is on)
+    var turbo = false;      // OFF at page start, never saved (shortens the waits between clicks)
+
+    // In turbo mode every wait is cut to a fraction (never below 25 ms).
+    // Drag gestures do not use this: the page needs their normal timing to recognize a drag.
+    function T(ms) {
+      return turbo ? Math.max(25, Math.round(ms * 0.2)) : ms;
+    }
+
+    // Wait after a reordering question's last drag before submitting. Not shortened by turbo,
+    // because the page needs time to settle its new order before the answer is checked.
+    var SUBMIT_AFTER_REORDER_MS = 1500;
+
+    // ---------- text helpers ----------
+    var SUB = '₀₁₂₃₄₅₆₇₈₉';
+
+    function tex(s) {
+      return s
+        .replace(/\\sf/g, '')
+        .replace(/\\xrightarrow\s*\{t\^o\}/g, ' →(t°) ')
+        .replace(/\\xrightarrow\s*\{[^}]*\}/g, ' → ')
+        .replace(/_\{?(\d+)\}?/g, function (m, d) {
+          return d.split('').map(function (c) { return SUB[+c]; }).join('');
+        })
+        .replace(/[{}]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+
+    function fmt(html) {
+      if (html == null) return '';
+      var d = new DOMParser().parseFromString(String(html), 'text/html');
+      d.querySelectorAll('.ql-formula').forEach(function (el) {
+        el.replaceWith(d.createTextNode(tex(el.getAttribute('data-value') || '')));
+      });
+      return d.body.textContent.replace(/\s+/g, ' ').trim();
+    }
+
+    function el(tag, cls, text) {
+      var e = document.createElement(tag);
+      if (cls) e.className = cls;
+      if (text != null) e.textContent = text;
+      return e;
+    }
+
+    function log(line) {
+      logLines.push(new Date().toLocaleTimeString() + ' ' + line);
+      if (logLines.length > 40) logLines.shift();
+      if (showLog) render();
+    }
+
+    // ---------- UI ----------
+    function ensureUI() {
+      if (ui && document.body && document.body.contains(ui.box)) return ui;
+      if (!document.body) return null;
+
+      var style = el('style');
+      style.textContent =
+        '.sq-box{position:fixed;right:8px;bottom:8px;width:min(340px,92vw);max-height:55vh;z-index:2147483647;' +
+        'background:#1e1e24;color:#eee;font:13px/1.4 system-ui,sans-serif;border-radius:10px;' +
+        'box-shadow:0 4px 18px rgba(0,0,0,.45);display:flex;flex-direction:column;overflow:hidden}' +
+        '.sq-head{display:flex;align-items:center;gap:6px;padding:6px 8px;background:#2d2d36;cursor:move;touch-action:none;user-select:none}' +
+        '.sq-title{flex:1;font-weight:600}' +
+        '.sq-count{opacity:.7;font-size:12px}' +
+        '.sq-btn{background:#444;color:#fff;border:0;border-radius:6px;padding:2px 9px;font-size:14px;cursor:pointer}' +
+        '.sq-body{padding:8px 10px;overflow:auto}' +
+        '.sq-min .sq-body,.sq-min .sq-opts{display:none}' +
+        '.sq-opts{display:flex;flex-wrap:wrap;gap:6px;padding:6px 8px;background:#26262e;border-bottom:1px solid #3a3a44}' +
+        '.sq-tgl{flex:1 1 90px;background:#3a3a44;color:#bbb;border:1px solid #555;border-radius:6px;padding:4px 6px;font-size:12px;cursor:pointer}' +
+        '.sq-tgl.on{background:#1f6f3a;border-color:#6ee787;color:#fff}' +
+        '.sq-tgl.turbo.on{background:#8a5a00;border-color:#ffc857;color:#fff}' +
+        '.sq-tgl.off-dim{opacity:.5}' +
+        '.sq-meta{font-size:11px;opacity:.6;margin-bottom:4px}' +
+        '.sq-q{opacity:.9;margin-bottom:8px}' +
+        '.sq-h{font-weight:600;margin:6px 0 2px}' +
+        '.sq-opt{margin:2px 0}' +
+        '.sq-ok{color:#6ee787}' +
+        '.sq-bad{color:#888}' +
+        '.sq-fb{font-size:12px;opacity:.75;margin-top:6px}' +
+        '.sq-dim{opacity:.6}' +
+        '.sq-log{font:11px/1.35 ui-monospace,monospace;opacity:.8;white-space:pre-wrap;word-break:break-all;margin-top:8px;border-top:1px solid #444;padding-top:6px}';
+
+      var box = el('div', 'sq-box');
+      var head = el('div', 'sq-head');
+      var title = el('span', 'sq-title', 'Quiz info');
+      var count = el('span', 'sq-count', '');
+      var prev = el('button', 'sq-btn', '◀');
+      var next = el('button', 'sq-btn', '▶');
+      var logBtn = el('button', 'sq-btn', '🐞');
+      var min = el('button', 'sq-btn', '–');
+      var body = el('div', 'sq-body');
+      var opts = el('div', 'sq-opts');
+      var fillBtn = el('button', 'sq-tgl', '');
+      var subBtn = el('button', 'sq-tgl', '');
+      var nextBtn = el('button', 'sq-tgl', '');
+      var turboBtn = el('button', 'sq-tgl turbo', '');
+      opts.appendChild(fillBtn);
+      opts.appendChild(subBtn);
+      opts.appendChild(nextBtn);
+      opts.appendChild(turboBtn);
+
+      head.appendChild(title);
+      head.appendChild(count);
+      head.appendChild(prev);
+      head.appendChild(next);
+      head.appendChild(logBtn);
+      head.appendChild(min);
+      box.appendChild(style);
+      box.appendChild(head);
+      box.appendChild(opts);
+      box.appendChild(body);
+      document.body.appendChild(box);
+
+      function step(delta) {
+        if (!order.length) return;
+        var i = order.indexOf(currentId);
+        i = i < 0 ? 0 : (i + delta + order.length) % order.length;
+        currentId = order[i];
+        render();
+      }
+      prev.addEventListener('click', function () { step(-1); });
+      next.addEventListener('click', function () { step(1); });
+      logBtn.addEventListener('click', function () { showLog = !showLog; render(); });
+      min.addEventListener('click', function () {
+        var m = box.classList.toggle('sq-min');
+        min.textContent = m ? '+' : '–';
+      });
+
+      // dragging (mouse + touch via pointer events)
+      var drag = null;
+      head.addEventListener('pointerdown', function (e) {
+        if (e.target.closest('button')) return;
+        var r = box.getBoundingClientRect();
+        drag = { dx: e.clientX - r.left, dy: e.clientY - r.top };
+        box.style.left = r.left + 'px';
+        box.style.top = r.top + 'px';
+        box.style.right = 'auto';
+        box.style.bottom = 'auto';
+        head.setPointerCapture(e.pointerId);
+      });
+      head.addEventListener('pointermove', function (e) {
+        if (!drag) return;
+        var x = Math.max(0, Math.min(window.innerWidth - 60, e.clientX - drag.dx));
+        var y = Math.max(0, Math.min(window.innerHeight - 30, e.clientY - drag.dy));
+        box.style.left = x + 'px';
+        box.style.top = y + 'px';
+      });
+      function endDrag() { drag = null; }
+      head.addEventListener('pointerup', endDrag);
+      head.addEventListener('pointercancel', endDrag);
+
+      fillBtn.addEventListener('click', function () {
+        autoFill = !autoFill;
+        log('auto-fill ' + (autoFill ? 'ON' : 'OFF'));
+        syncOpts();
+      });
+      subBtn.addEventListener('click', function () {
+        autoSubmit = !autoSubmit;
+        log('auto-submit ' + (autoSubmit ? 'ON' : 'OFF') + (autoSubmit && !autoFill ? ' (needs auto-fill)' : ''));
+        syncOpts();
+      });
+
+      nextBtn.addEventListener('click', function () {
+        autoNext = !autoNext;
+        log('auto-next ' + (autoNext ? 'ON' : 'OFF') + (autoNext && !autoFill ? ' (needs auto-fill)' : ''));
+        syncOpts();
+      });
+
+      turboBtn.addEventListener('click', function () {
+        turbo = !turbo;
+        log('turbo ' + (turbo ? 'ON' : 'OFF'));
+        syncOpts();
+      });
+
+      ui = { box: box, body: body, count: count, title: title, fillBtn: fillBtn, subBtn: subBtn, nextBtn: nextBtn, turboBtn: turboBtn };
+      syncOpts();
+      return ui;
+    }
+
+    function syncOpts() {
+      if (!ui) return;
+      ui.fillBtn.textContent = 'Auto-fill: ' + (autoFill ? 'ON' : 'OFF');
+      ui.fillBtn.classList.toggle('on', autoFill);
+      ui.subBtn.textContent = 'Auto-submit: ' + (autoSubmit ? 'ON' : 'OFF');
+      ui.subBtn.classList.toggle('on', autoSubmit);
+      ui.nextBtn.textContent = 'Auto-next: ' + (autoNext ? 'ON' : 'OFF');
+      ui.nextBtn.classList.toggle('on', autoNext);
+      ui.turboBtn.textContent = 'Turbo: ' + (turbo ? 'ON' : 'OFF');
+      ui.turboBtn.classList.toggle('on', turbo);
+      ui.subBtn.classList.toggle('off-dim', !autoFill);
+      ui.nextBtn.classList.toggle('off-dim', !autoFill);
+      ui.title.textContent = 'Quiz info' +
+        (autoFill ? ' · auto' + (autoSubmit ? '+submit' : '') + (autoNext ? '+next' : '') : '') +
+        (turbo ? ' · turbo' : '');
+    }
+
+    function renderLog(body) {
+      var btn = el('button', 'sq-btn', 'Copy log');
+      btn.style.marginTop = '8px';
+      btn.addEventListener('click', function () {
+        var txt = logLines.join('\n');
+        try { navigator.clipboard.writeText(txt); btn.textContent = 'Copied'; }
+        catch (e) { window.prompt('Copy log:', txt); }
+      });
+      body.appendChild(btn);
+      body.appendChild(el('div', 'sq-log', logLines.length ? logLines.join('\n') : '(nothing logged yet)'));
+    }
+
+    function render() {
+      var u = ensureUI();
+      if (!u) return;
+      var body = u.body;
+      body.textContent = '';
+      var q = questions[currentId];
+
+      if (!q) {
+        u.count.textContent = '';
+        if (currentId != null) {
+          body.appendChild(el('div', 'sq-q',
+            'Question ' + currentId + ' is open, but its data was not captured. ' +
+            'Reload the page, then start the quiz again. If this stays empty, send the log below.'));
+        } else {
+          body.appendChild(el('div', 'sq-dim', 'Waiting for quiz data… start a quiz (reload the page first if it was already open).'));
+        }
+        renderLog(body);
+        return;
+      }
+
+      var idx = order.indexOf(q.id);
+      u.count.textContent = idx >= 0 ? (idx + 1) + '/' + order.length : '';
+
+      body.appendChild(el('div', 'sq-meta', 'id ' + q.id + ' · ' + q.variation + ' · level ' + q.level));
+
+      var qtext = fmt(q.question_content).replace(/\[p\](\d+)\[\/p\]/g, '___($1)');
+      body.appendChild(el('div', 'sq-q', qtext));
+
+      var answers = q.answers || [];
+      var correct = answers.filter(function (a) { return a.correct; });
+
+      if (q.variation === 'multi_choice' || q.variation === 'multiple_response') {
+        body.appendChild(el('div', 'sq-h', q.variation === 'multiple_response' ? 'Options (select all ✓):' : 'Options:'));
+        answers.forEach(function (a) {
+          body.appendChild(el('div', 'sq-opt ' + (a.correct ? 'sq-ok' : 'sq-bad'),
+            (a.correct ? '✓ ' : '✗ ') + fmt(a.text)));
+          if (!a.correct && a.feedback) {
+            body.appendChild(el('div', 'sq-fb', '   ↳ ' + fmt(a.feedback)));
+          }
+        });
+      } else if (q.variation === 'open_ended_response') {
+        body.appendChild(el('div', 'sq-h', 'Fill in the blanks:'));
+        correct.forEach(function (a, i) {
+          body.appendChild(el('div', 'sq-opt sq-ok', '(' + (i + 1) + ') ' + fmt(a.text)));
+        });
+      } else if (/order|sort|rank|sequen/i.test(q.variation || '')) {
+        var co = correctOrder(q);
+        body.appendChild(el('div', 'sq-h', 'Correct order (' + co.by + '):'));
+        co.list.forEach(function (a, i) {
+          body.appendChild(el('div', 'sq-opt sq-ok', (i + 1) + '. ' + fmt(a.text)));
+        });
+      } else {
+        // "text" and any other type: show every answer flagged correct
+        body.appendChild(el('div', 'sq-h', 'Accepted answer(s):'));
+        if (!correct.length && answers.length) {
+          // no "correct" flag present: show raw answers
+          answers.forEach(function (a) { body.appendChild(el('div', 'sq-opt', fmt(a.text))); });
+        }
+        correct.forEach(function (a) {
+          body.appendChild(el('div', 'sq-opt sq-ok', fmt(a.text)));
+        });
+      }
+
+      var fb = fmt(q.correct_answer_feedback);
+      if (fb) body.appendChild(el('div', 'sq-fb', 'Explanation: ' + fb));
+
+      if (showLog) renderLog(body);
+    }
+
+    // ---------- data capture ----------
+    function isQuestion(o) {
+      return o && typeof o === 'object' && !Array.isArray(o) &&
+        typeof o.id === 'number' && Array.isArray(o.answers) &&
+        ('question_content' in o || 'variation' in o);
+    }
+
+    function walk(o, depth, found) {
+      if (!o || typeof o !== 'object' || depth > 12) return;
+      if (Array.isArray(o)) {
+        for (var i = 0; i < o.length; i++) walk(o[i], depth + 1, found);
+        return;
+      }
+      if (isQuestion(o)) { found.push(o); return; }
+      var keys = Object.keys(o);
+      for (var k = 0; k < keys.length; k++) {
+        var v = o[keys[k]];
+        if (v && typeof v === 'object') walk(v, depth + 1, found);
+      }
+    }
+
+    function ingest(found) {
+      var uniq = {};
+      var list = [];
+      found.forEach(function (q) {
+        if (!uniq[q.id]) { uniq[q.id] = true; list.push(q); }
+        questions[q.id] = q;
+      });
+      if (list.length > 1) {
+        list.sort(function (a, b) { return (a.order || 0) - (b.order || 0); });
+        order = list.map(function (q) { return q.id; });
+      } else {
+        list.forEach(function (q) { if (order.indexOf(q.id) < 0) order.push(q.id); });
+      }
+      if (currentId == null) currentId = order[0];
+    }
+
+    function scan(data, label) {
+      var found = [];
+      try { walk(data, 0, found); } catch (e) {}
+      if (found.length) {
+        ingest(found);
+        log(label + ' → ' + found.length + ' question(s)');
+        render();
+      } else {
+        log(label + ' → no questions');
+      }
+    }
+
+    var QT = /\/quizzes\/question_times\/(\d+)/;
+
+    function onQuestionStart(url) {
+      var m = QT.exec(url);
+      if (!m) return false;
+      currentId = +m[1];
+      log('question_times ' + currentId + (questions[currentId] ? ' (known)' : ' (UNKNOWN)'));
+      render();
+      return true;
+    }
+
+    function interesting(url) {
+      return /soma\.lv/.test(url) || url.charAt(0) === '/';
+    }
+
+    // fetch hook
+    var origFetch = window.fetch;
+    if (origFetch) {
+      window.fetch = function () {
+        var args = arguments;
+        var url = '';
+        try { url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || ''; } catch (e) {}
+        var method = (args[1] && args[1].method) || (args[0] && args[0].method) || 'GET';
+        var p = origFetch.apply(this, args);
+        try {
+          if (interesting(url)) {
+            if (!onQuestionStart(url)) {
+              p.then(function (r) {
+                var ct = (r.headers && r.headers.get && r.headers.get('content-type')) || '';
+                if (ct.indexOf('json') < 0) return;
+                return r.clone().text().then(function (t) {
+                  if (t.length > 8e6) return;
+                  scan(JSON.parse(t), 'fetch ' + method + ' ' + url.replace(/^https?:\/\/[^/]+/, ''));
+                });
+              }).catch(function () {});
+            }
+          }
+        } catch (e) {}
+        return p;
+      };
+    }
+
+    // XHR hook
+    var origOpen = XMLHttpRequest.prototype.open;
+    var origSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (method, url) {
+      this.__somaUrl = String(url);
+      this.__somaMethod = method;
+      return origOpen.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function () {
+      var xhr = this;
+      var url = xhr.__somaUrl || '';
+      try {
+        if (interesting(url) && !onQuestionStart(url)) {
+          xhr.addEventListener('load', function () {
+            try {
+              var d = xhr.responseType === 'json' ? xhr.response : JSON.parse(xhr.responseText);
+              scan(d, 'xhr ' + xhr.__somaMethod + ' ' + url.replace(/^https?:\/\/[^/]+/, ''));
+            } catch (e) {}
+          });
+        }
+      } catch (e) {}
+      return origSend.apply(this, arguments);
+    };
+
+    // WebSocket hook (Soma uses ActionCable channels, e.g. StudentRepeatableQuizzesChannel)
+    var OrigWS = window.WebSocket;
+    if (OrigWS) {
+      var PatchedWS = function (url, protocols) {
+        var ws = protocols !== undefined ? new OrigWS(url, protocols) : new OrigWS(url);
+        try {
+          ws.addEventListener('message', function (ev) {
+            if (typeof ev.data !== 'string' || ev.data.indexOf('"ping"') > -1) return;
+            try { scan(JSON.parse(ev.data), 'ws message'); } catch (e) {}
+          });
+        } catch (e) {}
+        return ws;
+      };
+      PatchedWS.prototype = OrigWS.prototype;
+      ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(function (k) { PatchedWS[k] = OrigWS[k]; });
+      window.WebSocket = PatchedWS;
+    }
+
+    // ---------- auto-fill / auto-submit ----------
+    // Only runs while the "Auto-fill" toggle is ON. Submitting additionally needs "Auto-submit" ON.
+    var auto = { key: null, filledAt: 0, submitted: false, busyUntil: 0, tries: 0, ordering: false, orderFail: null, filling: false, wbFail: null, cnFail: null }; // state of the question already handled
+    var seen = { sig: null, since: 0 };                      // waits until the DOM has settled
+    var nextState = { seenKey: null, since: 0, clicked: null }; // one click per feedback screen
+    var lastWarn = '';
+
+    function warnOnce(msg) {
+      if (lastWarn !== msg) { lastWarn = msg; log('auto: ' + msg); }
+    }
+
+    function norm(s) {
+      return String(s == null ? '' : s).toLowerCase().replace(/[^a-z0-9À-ɏ]+/g, '');
+    }
+
+    function activeDialog() {
+      var d = document.querySelectorAll('.v-dialog.v-overlay--active');
+      return d.length ? d[d.length - 1] : null;
+    }
+
+    // Vue ignores plain `.value = x`; use the native setter and fire the events it listens for.
+    function setNative(input, value) {
+      var proto = input.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(proto, 'value').set.call(input, value);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    // true / false for a known answer, null if the input can't be matched to an answer
+    function isCorrectInput(inp, answers) {
+      var v = String(inp.value), i;
+      for (i = 0; i < answers.length; i++) {
+        if (answers[i].id != null && String(answers[i].id) === v) return !!answers[i].correct;
+      }
+      var wrap = inp.closest('.v-selection-control');
+      var label = wrap ? norm(wrap.textContent) : '';
+      if (label) {
+        for (i = 0; i < answers.length; i++) {
+          if (norm(fmt(answers[i].text)) === label) return !!answers[i].correct;
+        }
+      }
+      return null;
+    }
+
+    // What the page's own component thinks is selected (the raw input.checked can disagree with it).
+    function isSelected(inp) {
+      var w = inp.closest('.v-selection-control');
+      return w ? w.classList.contains('v-selection-control--dirty') : inp.checked;
+    }
+
+    function choicesMatch(q, choices) {
+      var answers = q.answers || [];
+      return choices.every(function (inp) {
+        var ok = isCorrectInput(inp, answers);
+        return ok === null || isSelected(inp) === ok;
+      });
+    }
+
+    // Choice inputs carry the answer id as their value, so the question can be identified from the page itself.
+    function findByAnswerIds(values) {
+      for (var id in questions) {
+        var ids = (questions[id].answers || []).map(function (a) { return String(a.id); });
+        if (values.length && values.every(function (v) { return ids.indexOf(v) >= 0; })) return questions[id];
+      }
+      return null;
+    }
+
+    // Guards against filling the previous/next question while currentId is out of date.
+    function sameText(domText, q) {
+      var a = norm(domText);
+      var b = norm(fmt(q.question_content).replace(/\[p\]\d+\[\/p\]/g, ''));
+      if (!a || !b) return true;
+      return a === b || b.indexOf(a.slice(0, 10)) >= 0;
+    }
+
+    function doFill(dlg, q, choices, texts) {
+      var answers = q.answers || [];
+      var correct = answers.filter(function (a) { return a.correct; });
+
+      if (choices.length) {
+        var known = 0, todo = [];
+        choices.forEach(function (inp) {
+          var ok = isCorrectInput(inp, answers);
+          if (ok === null) return;
+          known++;
+          var sel = isSelected(inp);
+          if (inp.type === 'radio' ? (ok && !sel) : (sel !== ok)) todo.push(inp);
+        });
+        if (!known) { warnOnce('could not match options to answers for Q' + q.id); return false; }
+        if (!correct.length) { warnOnce('Q' + q.id + ' has no answer flagged correct'); return false; }
+        // One click at a time: the page updates its selection list asynchronously, and two clicks
+        // in the same instant make the second overwrite the first (only one box stays ticked).
+        var GAP = T(100);
+        todo.forEach(function (inp, i) { setTimeout(function () { inp.click(); }, i * GAP); });
+        auto.busyUntil = Date.now() + todo.length * GAP + T(400);
+        log('auto: filled Q' + q.id + ' (' + q.variation + ', ' + todo.length + ' click' + (todo.length === 1 ? '' : 's') + ')');
+        return true;
+      }
+
+      var blanks = q.variation === 'open_ended_response';
+      var wrap = blanks ? texts[0].closest('.open-ended-response') : dlg.querySelector('.quiz-modal-question-content');
+      if (wrap && !sameText(wrap.textContent, q)) {
+        warnOnce('page text does not match Q' + q.id + ' yet, waiting');
+        return false;
+      }
+      if (!correct.length) { warnOnce('Q' + q.id + ' has no answer flagged correct'); return false; }
+      if (blanks) {
+        texts.forEach(function (inp, i) { if (correct[i]) setNative(inp, fmt(correct[i].text)); });
+      } else {
+        setNative(texts[0], fmt(correct[0].text));
+      }
+      log('auto: filled Q' + q.id + ' (' + q.variation + ')');
+      return true;
+    }
+
+    function trySubmit(dlg) {
+      var btn = dlg.querySelector('.quiz-modal-submit-answer-btn');
+      if (!btn || btn.disabled || btn.classList.contains('disabled')) return; // not enabled (yet)
+      if (!/atbild/i.test(btn.textContent)) return;                          // never click "next question" here
+      auto.submitted = true;
+      btn.click();
+      log('auto: submitted');
+    }
+
+    // ---------- reordering questions ----------
+    var ORDER_KEYS = ['position', 'correct_position', 'correct_order', 'sort_order', 'order', 'ordinal', 'sequence', 'index', 'rank'];
+
+    // The correct sequence: a numeric position-like field on the answers if there is one, else the order they arrive in.
+    function correctOrder(q) {
+      var ans = (q.answers || []).slice();
+      for (var k = 0; k < ORDER_KEYS.length; k++) {
+        var key = ORDER_KEYS[k];
+        var vals = ans.map(function (a) { return a[key]; });
+        var numeric = vals.every(function (v) { return v !== null && v !== undefined && v !== '' && isFinite(Number(v)); });
+        var distinct = numeric && vals.filter(function (v, i) { return vals.indexOf(v) === i; }).length === vals.length;
+        if (distinct) return { list: ans.sort(function (a, b) { return Number(a[key]) - Number(b[key]); }), by: key };
+      }
+      return { list: ans, by: 'array order' };
+    }
+
+    function orderItems(dlg, interactableOnly) {
+      return [].slice.call(dlg.querySelectorAll('.ordered-response .item' + (interactableOnly ? '.interactable' : '')));
+    }
+
+    // For every row on screen, the index of the answer it shows (or null if some row can't be matched).
+    function mapItems(items, q) {
+      var ans = q.answers || [], used = {}, res = [];
+      if (!items.length || ans.length < items.length) return null;
+      for (var i = 0; i < items.length; i++) {
+        var t = norm(items[i].textContent), found = -1, j;
+        for (j = 0; j < ans.length && found < 0; j++) {
+          if (!used[j] && norm(fmt(ans[j].text)) === t) found = j;
+        }
+        for (j = 0; j < ans.length && found < 0 && t; j++) {
+          var na = norm(fmt(ans[j].text));
+          if (!used[j] && na && (t.indexOf(na) >= 0 || na.indexOf(t) >= 0)) found = j;
+        }
+        if (found < 0) return null;
+        used[found] = true;
+        res.push(found);
+      }
+      return res;
+    }
+
+    function findOrderQuestion(items) {
+      var ids = Object.keys(questions);
+      if (currentId != null && questions[currentId]) ids.unshift(String(currentId));
+      for (var i = 0; i < ids.length; i++) {
+        var idx = mapItems(items, questions[ids[i]]);
+        if (idx) return { q: questions[ids[i]], idx: idx };
+      }
+      return null;
+    }
+
+    function wantedIdx(q, cur) {
+      var ans = q.answers || [];
+      return correctOrder(q).list.map(function (a) { return ans.indexOf(a); })
+        .filter(function (i) { return cur.indexOf(i) >= 0; });
+    }
+
+    function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+    function fire(target, Ctor, type, x, y, extra) {
+      try {
+        var init = { bubbles: true, cancelable: true, composed: true, view: window, clientX: x, clientY: y, screenX: x, screenY: y, button: 0 };
+        for (var k in extra) init[k] = extra[k];
+        target.dispatchEvent(new Ctor(type, init));
+      } catch (e) {}
+    }
+
+    function underPoint(x, y, fallback) { return document.elementFromPoint(x, y) || fallback; }
+
+    function uniq(list) { return list.filter(function (t, i) { return list.indexOf(t) === i; }); }
+
+    var PBASE = { pointerId: 1, pointerType: 'mouse', isPrimary: true, width: 1, height: 1 };
+
+    function press(src, x, y) {
+      fire(src, PointerEvent, 'pointerdown', x, y, Object.assign({ buttons: 1, pressure: 0.5 }, PBASE));
+      fire(src, MouseEvent, 'mousedown', x, y, { buttons: 1 });
+    }
+    function release(src, x, y) {
+      uniq([src, underPoint(x, y, src)]).forEach(function (t) {
+        fire(t, PointerEvent, 'pointerup', x, y, Object.assign({ buttons: 0, pressure: 0 }, PBASE));
+        fire(t, MouseEvent, 'mouseup', x, y, { buttons: 0 });
+      });
+    }
+
+    // Ways of "dragging", because the page's drag code is not known. reorder() uses whichever one moves a row.
+    // Drag timing is never shortened by turbo.
+    // 1) what a desktop browser does for a natively draggable element (press, a few pixels, dragstart, dragover..., drop, dragend)
+    async function dragNative(src, dst, x, y0, y1) {
+      var dir = y1 < y0 ? -1 : 1;
+      press(src, x, y0);
+      await sleep(120);
+      for (var k = 1; k <= 3; k++) {
+        var yy = y0 + dir * k * 2;
+        fire(src, PointerEvent, 'pointermove', x, yy, Object.assign({ buttons: 1, pressure: 0.5 }, PBASE));
+        fire(src, MouseEvent, 'mousemove', x, yy, { buttons: 1 });
+        await sleep(15);
+      }
+      var dt = new DataTransfer();
+      fire(src, DragEvent, 'dragstart', x, y0 + dir * 6, { dataTransfer: dt, buttons: 1 });
+      await sleep(80);
+      for (var s = 1; s <= 12; s++) {
+        var y = y0 + (y1 - y0) * s / 12;
+        var t = underPoint(x, y, dst);
+        fire(t, DragEvent, 'dragenter', x, y, { dataTransfer: dt, buttons: 1 });
+        fire(t, DragEvent, 'dragover', x, y, { dataTransfer: dt, buttons: 1 });
+        await sleep(35);
+      }
+      var end = underPoint(x, y1, dst);
+      for (var r = 0; r < 4; r++) { fire(end, DragEvent, 'dragover', x, y1, { dataTransfer: dt, buttons: 1 }); await sleep(40); }
+      fire(end, DragEvent, 'drop', x, y1, { dataTransfer: dt });
+      fire(src, DragEvent, 'dragend', x, y1, { dataTransfer: dt });
+      await sleep(40);
+      release(src, x, y1);
+    }
+
+    // 2) a pointer-event drag (long press first, small first moves, movement fields set)
+    async function dragPointer(src, dst, x, y0, y1) {
+      press(src, x, y0);
+      await sleep(450);
+      var prev = y0, steps = 20;
+      for (var s = 1; s <= steps; s++) {
+        var y = s === 1 ? y0 + (y1 < y0 ? -4 : 4) : y0 + (y1 - y0) * s / steps;
+        uniq([src, underPoint(x, y, src)]).forEach(function (t) {
+          fire(t, PointerEvent, 'pointermove', x, y, Object.assign({ buttons: 1, pressure: 0.5, movementX: 0, movementY: y - prev }, PBASE));
+          fire(t, MouseEvent, 'mousemove', x, y, { buttons: 1, movementX: 0, movementY: y - prev });
+        });
+        prev = y;
+        await sleep(30);
+      }
+      await sleep(80);
+      release(src, x, y1);
+    }
+
+    // 3) a touch drag (long press first)
+    async function dragTouch(src, dst, x, y0, y1) {
+      if (typeof Touch === 'undefined' || typeof TouchEvent === 'undefined') return;
+      function ev(type, y, ending) {
+        var t = new Touch({ identifier: 1, target: src, clientX: x, clientY: y, screenX: x, screenY: y, pageX: x, pageY: y });
+        var live = ending ? [] : [t];
+        fire(src, TouchEvent, type, x, y, { touches: live, targetTouches: live, changedTouches: [t] });
+      }
+      ev('touchstart', y0, false);
+      await sleep(450);
+      for (var s = 1; s <= 20; s++) { ev('touchmove', y0 + (y1 - y0) * s / 20, false); await sleep(30); }
+      ev('touchend', y1, true);
+    }
+
+    // Moves the rows into the wanted order (answer indices). Returns true when the page shows that order.
+    async function reorder(dlg, q) {
+      var oldSet = Element.prototype.setPointerCapture, oldRel = Element.prototype.releasePointerCapture;
+      if (ui) ui.box.style.pointerEvents = 'none'; // so our own panel never sits between the "pointer" and the rows
+      // synthetic pointers are not real to the browser; capture calls would throw and abort the page's handler
+      Element.prototype.setPointerCapture = function () {};
+      Element.prototype.releasePointerCapture = function () {};
+      try {
+        var cont = dlg.querySelector('.ordered-response');
+        if (cont && cont.scrollIntoView) { cont.scrollIntoView({ block: 'center' }); await sleep(T(250)); }
+        var modes = [dragNative, dragPointer, dragTouch], names = ['native', 'pointer', 'touch'], mode = 0;
+        for (var guard = 0; guard < 30; guard++) {
+          if (!autoFill) return false;
+          var items = orderItems(dlg, false);
+          var cur = mapItems(items, q);
+          if (!cur) return false;
+          var want = wantedIdx(q, cur);
+          var pos = 0;
+          while (pos < want.length && cur[pos] === want[pos]) pos++;
+          if (pos >= want.length) return true;
+          var from = cur.indexOf(want[pos]);
+          if (from < 0 || mode >= modes.length) return false;
+          var item = items[from], target = items[pos];
+          var rs = item.getBoundingClientRect(), rd = target.getBoundingClientRect();
+          var icon = item.querySelector('.v-icon');
+          var ri = icon ? icon.getBoundingClientRect() : rs;
+          var x = ri.left + ri.width / 2;
+          var y0 = rs.top + rs.height / 2;
+          var y1 = rd.top + rd.height * 0.3;
+          var src = underPoint(x, y0, item);
+          if (!item.contains(src)) src = item;
+          await modes[mode](src, target, x, y0, y1);
+          await sleep(450);
+          var after = mapItems(orderItems(dlg, false), q);
+          if (after && after.join() === cur.join()) {
+            log('auto: ' + names[mode] + ' drag moved nothing');
+            mode++; // nothing moved: try the next kind of drag
+          } else if (mode !== reorder.lastMode) { reorder.lastMode = mode; log('auto: ' + names[mode] + ' drag works'); }
+        }
+        return false;
+      } finally {
+        Element.prototype.setPointerCapture = oldSet;
+        Element.prototype.releasePointerCapture = oldRel;
+        if (ui) ui.box.style.pointerEvents = '';
+      }
+    }
+
+    // names of library-looking properties on the list and its parents (helps to identify the drag library)
+    function libHints(dlg) {
+      var out = [], n = dlg.querySelector('.ordered-response');
+      for (var d = 0; n && d < 4; d++, n = n.parentElement) {
+        Object.keys(n).forEach(function (k) { if (/sortable|drag|vue|sort/i.test(k)) out.push(k); });
+      }
+      return out.join(',') || 'none';
+    }
+
+    function orderTick(dlg, items) {
+      var found = findOrderQuestion(items);
+      if (!found) { warnOnce('no question data matches these rows yet'); return; }
+      var q = found.q, cur = found.idx, want = wantedIdx(q, cur);
+      if (want.length !== cur.length) { warnOnce('could not work out the order for Q' + q.id); return; }
+      var sig = 'ord|' + q.id + '|' + items.length;
+      var now = Date.now();
+      if (sig !== seen.sig) { seen.sig = sig; seen.since = now; return; } // wait for the DOM to settle
+      if (now - seen.since < T(350)) return;
+
+      if (cur.join() !== want.join()) {
+        if (auto.ordering || auto.orderFail === sig) return;
+        auto.ordering = true;
+        var co = correctOrder(q);
+        log('auto: ordering Q' + q.id + ' (order from ' + co.by + '; lib hints: ' + libHints(dlg) + ')');
+        log('  answers: ' + (q.answers || []).map(function (a) { return a.id + '@' + a.position; }).join(' ') + ' | now on screen: ' + cur.join(','));
+        reorder(dlg, q).then(function (ok) {
+          auto.ordering = false;
+          if (ok) {
+            // the wait before submitting starts from the end of the last drag
+            auto.key = sig;
+            auto.filledAt = Date.now();
+            auto.submitted = false;
+            log('auto: ordered Q' + q.id + ', waiting ' + SUBMIT_AFTER_REORDER_MS + ' ms before submit');
+          } else {
+            auto.orderFail = sig;
+            warnOnce('could not drag the rows into order for Q' + q.id + ', do it yourself');
+          }
+        }, function (e) {
+          auto.ordering = false; auto.orderFail = sig; warnOnce('reorder error: ' + e.message);
+        });
+        return;
+      }
+      // the order on screen is the wanted one (reached without a drag this time)
+      if (auto.key !== sig) { auto.key = sig; auto.filledAt = now; auto.submitted = false; return; }
+      // after a reorder the wait is fixed (not turbo-shortened); otherwise the normal short wait
+      var submitWait = auto.key === sig && auto.dragged ? SUBMIT_AFTER_REORDER_MS : T(400);
+      if (autoSubmit && !auto.submitted && now - auto.filledAt > submitWait) trySubmit(dlg);
+    }
+
+    // ---------- word bank: select an empty blank, then click the word ----------
+    function wbText(e) { return norm(e.textContent); }
+
+    function findWordBankQuestion(dlg, slotCount) {
+      var bank = [].slice.call(dlg.querySelectorAll('.drag-to-text-bank-item')).map(wbText);
+      var qtext = dlg.querySelector('.drag-to-text-text');
+      var ids = Object.keys(questions);
+      if (currentId != null && questions[currentId]) ids.unshift(String(currentId));
+      for (var i = 0; i < ids.length; i++) {
+        var q = questions[ids[i]];
+        var ans = q.answers || [];
+        if (ans.filter(function (a) { return a.correct; }).length !== slotCount) continue;
+        var pool = ans.map(function (a) { return norm(fmt(a.text)); });
+        if (bank.every(function (t) { return pool.indexOf(t) >= 0; }) &&
+            (!qtext || sameText(qtext.textContent, q))) return q;
+      }
+      return null;
+    }
+
+    async function fillWordBank(dlg, q, slots) {
+      var correct = (q.answers || []).filter(function (a) { return a.correct; });
+      for (var i = 0; i < slots.length; i++) {
+        if (!autoFill) return false;
+        var slot = slots[i];
+        if (slot.textContent.trim()) continue; // already filled
+        var want = norm(fmt(correct[i].text));
+        var item = [].slice.call(dlg.querySelectorAll('.drag-to-text-bank-item'))
+          .filter(function (b) { return wbText(b) === want; })[0];
+        if (!item) { warnOnce('word "' + want + '" not in bank for Q' + q.id); return false; }
+
+        slot.click();           // 1) select the empty blank
+        await sleep(T(150));
+        item.click();           // 2) click the word, it goes into the selected blank
+        await sleep(T(250));
+      }
+      return true;
+    }
+
+    function wordBankTick(dlg, slots) {
+      var q = findWordBankQuestion(dlg, slots.length);
+      if (!q) { warnOnce('no question data matches this word bank yet'); return; }
+      var filled = [].filter.call(slots, function (s) { return s.textContent.trim(); }).length;
+      var sig = 'wb|' + q.id + '|' + slots.length + '|' + filled;
+      var now = Date.now();
+      if (sig !== seen.sig) { seen.sig = sig; seen.since = now; return; }
+      if (now - seen.since < T(350)) return;
+
+      if (filled < slots.length) {
+        if (auto.filling || auto.wbFail === sig) return;
+        auto.filling = true;
+        log('auto: filling word bank Q' + q.id);
+        fillWordBank(dlg, q, slots).then(function (ok) {
+          auto.filling = false;
+          if (!ok) auto.wbFail = sig;
+        }, function (e) {
+          auto.filling = false; auto.wbFail = sig; warnOnce('word bank error: ' + e.message);
+        });
+        return;
+      }
+      if (auto.key !== sig) { auto.key = sig; auto.filledAt = now; auto.submitted = false; return; }
+      if (autoSubmit && !auto.submitted && now - auto.filledAt > T(400)) trySubmit(dlg);
+    }
+
+    // ---------- connecting rows: click a left item, then its right partner ----------
+    function cnText(e) { return norm(e.textContent); }
+
+    // correct answers as [leftNorm, rightNorm] pairs, split on the "|" separator
+    function connectPairs(q) {
+      return (q.answers || []).filter(function (a) { return a.correct; }).map(function (a) {
+        var parts = fmt(a.text).split('|');
+        return parts.length === 2 ? [norm(parts[0]), norm(parts[1])] : null;
+      });
+    }
+
+    function findConnectQuestion(dlg) {
+      var lefts = [].slice.call(dlg.querySelectorAll('.connecting-row > .connecting-item:first-child')).map(cnText);
+      var rights = [].slice.call(dlg.querySelectorAll('.connecting-row > .connecting-item:last-child')).map(cnText);
+      var ids = Object.keys(questions);
+      if (currentId != null && questions[currentId]) ids.unshift(String(currentId));
+      for (var i = 0; i < ids.length; i++) {
+        var q = questions[ids[i]], pairs = connectPairs(q);
+        if (!pairs.length || pairs.indexOf(null) >= 0 || pairs.length !== lefts.length) continue;
+        var ok = pairs.every(function (p) { return lefts.indexOf(p[0]) >= 0 && rights.indexOf(p[1]) >= 0; });
+        if (ok) return q;
+      }
+      return null;
+    }
+
+    function findConnectItem(dlg, side, text) {
+      var sel = side === 'left'
+        ? '.connecting-row > .connecting-item:first-child'
+        : '.connecting-row > .connecting-item:last-child';
+      return [].slice.call(dlg.querySelectorAll(sel)).filter(function (e) { return cnText(e) === text; })[0];
+    }
+
+    async function fillConnect(dlg, q) {
+      var pairs = connectPairs(q);
+      for (var i = 0; i < pairs.length; i++) {
+        if (!autoFill) return false;
+        var l = findConnectItem(dlg, 'left', pairs[i][0]);
+        var r = findConnectItem(dlg, 'right', pairs[i][1]);
+        if (!l || !r) { warnOnce('connect: item not found for Q' + q.id); return false; }
+        l.click();             // 1) pick the left item
+        await sleep(T(150));
+        r.click();             // 2) pick its right partner, they connect
+        await sleep(T(250));
+      }
+      return true;
+    }
+
+    function connectTick(dlg) {
+      var q = findConnectQuestion(dlg);
+      if (!q) { warnOnce('no question data matches this connecting question yet'); return; }
+      var sig = 'cn|' + q.id + '|' + dlg.querySelectorAll('.connecting-row').length;
+      var now = Date.now();
+      if (sig !== seen.sig) { seen.sig = sig; seen.since = now; return; }
+      if (now - seen.since < T(350)) return;
+
+      if (auto.key !== sig) {
+        if (auto.filling || auto.cnFail === sig) return;
+        auto.filling = true;
+        log('auto: connecting Q' + q.id);
+        fillConnect(dlg, q).then(function (ok) {
+          auto.filling = false;
+          if (ok) { auto.key = sig; auto.filledAt = Date.now(); auto.submitted = false; }
+          else auto.cnFail = sig;
+        }, function (e) {
+          auto.filling = false; auto.cnFail = sig; warnOnce('connect error: ' + e.message);
+        });
+        return;
+      }
+      if (autoSubmit && !auto.submitted && now - auto.filledAt > T(400)) trySubmit(dlg);
+    }
+
+    // Records what a MANUAL drag on a reordering row looks like (real events only), so the log shows how the page reacts.
+    (function () {
+      var on = false, counts = {};
+      function describe(e) {
+        var t = e.target;
+        return (t && t.tagName ? t.tagName.toLowerCase() + (t.className && t.className.baseVal === undefined ? '.' + String(t.className).split(' ')[0] : '') : '?') +
+          ' ptr=' + (e.pointerType || '-') + ' btn=' + e.buttons + ' my=' + e.movementY + ' y=' + Math.round(e.clientY);
+      }
+      ['pointerdown', 'mousedown', 'touchstart', 'dragstart'].forEach(function (type) {
+        window.addEventListener(type, function (e) {
+          if (!e.isTrusted || !e.target.closest) return;
+          var it = e.target.closest('.ordered-response .item');
+          if (!it) return;
+          if (!on) { on = true; counts = {}; }
+          log('manual ' + type + ' on row, ' + describe(e) + ' | row class="' + it.className + '" draggable=' + it.getAttribute('draggable'));
+          setTimeout(function () { log('  row 200ms later: class="' + it.className + '" draggable=' + it.getAttribute('draggable') + ' list class="' + (it.parentNode && it.parentNode.className) + '"'); }, 200);
+        }, true);
+      });
+      ['pointermove', 'mousemove', 'touchmove', 'dragenter', 'dragover', 'pointerup', 'mouseup', 'touchend', 'drop', 'dragend', 'pointercancel'].forEach(function (type) {
+        window.addEventListener(type, function (e) {
+          if (!on || !e.isTrusted) return;
+          counts[type] = (counts[type] || 0) + 1;
+          if (counts[type] === 1) log('  first ' + type + ': ' + describe(e));
+          if (/^(pointerup|mouseup|touchend|drop|dragend|pointercancel)$/.test(type) && counts.__t == null) {
+            counts.__t = setTimeout(function () {
+              delete counts.__t; on = false;
+              log('  manual drag summary: ' + JSON.stringify(counts));
+            }, 250);
+          }
+        }, true);
+      });
+    })();
+
+    function autoTick() {
+      if (!autoFill) return;
+      var dlg = activeDialog();
+      if (!dlg) return;
+      if (Date.now() < auto.busyUntil) return; // still clicking options one by one
+
+      // After an answer is submitted the same button reads "Nākamais jautājums" (next question).
+      var btn = dlg.querySelector('.quiz-modal-submit-answer-btn');
+      var label = btn ? btn.textContent.trim() : '';
+      if (/atbild/i.test(label)) {
+        nextState.seenKey = null; nextState.clicked = null;
+      } else if (btn && !btn.disabled) {
+        auto.orderFail = null; // feedback screen: a later repeat of the same question may be tried again
+        auto.wbFail = null;
+        auto.cnFail = null;
+      }
+      if (!/atbild/i.test(label) && autoNext && btn && !btn.disabled && !btn.classList.contains('disabled')) {
+        var cur = dlg.querySelector('.current-question-circle');
+        var nk = (cur ? cur.textContent.trim() : '?') + '|' + label;
+        var t = Date.now();
+        if (nextState.seenKey !== nk) { nextState.seenKey = nk; nextState.since = t; }
+        else if (t - nextState.since > T(800) && nextState.clicked !== nk) {
+          nextState.clicked = nk;
+          btn.click();
+          log('auto: ' + label);
+          return;
+        }
+      }
+
+      var oitems = orderItems(dlg, true); // reordering question (drag the rows)
+      if (oitems.length) { orderTick(dlg, oitems); return; }
+
+      var wbSlots = dlg.querySelectorAll('.drag-to-text-slot'); // word bank (select blank, then click word)
+      if (wbSlots.length) { wordBankTick(dlg, wbSlots); return; }
+
+      if (dlg.querySelector('.connecting-row')) { connectTick(dlg); return; } // connecting rows (left item, then right partner)
+
+      var enabled = function (i) { return !i.disabled; };
+      var choices = [].slice.call(dlg.querySelectorAll('input[type=radio],input[type=checkbox]')).filter(enabled);
+      var texts = [].slice.call(dlg.querySelectorAll('input[type=text],input:not([type]),textarea')).filter(enabled);
+      var first = choices[0] || texts[0];
+      if (!first) {
+        seen.sig = null;
+        if (dlg.querySelector('.mark-on-image-response')) warnOnce('"mark on image" questions are not supported, answer manually');
+        return;
+      }
+
+      var q = choices.length ? findByAnswerIds(choices.map(function (i) { return String(i.value); })) : null;
+      if (!q) q = questions[currentId];
+      if (!q) { warnOnce('question data not captured yet'); return; }
+
+      var sig = q.id + '|' + first.id + '|' + choices.map(function (i) { return i.value; }).join(',') + '|' + texts.length;
+      var now = Date.now();
+      if (sig !== seen.sig) { seen.sig = sig; seen.since = now; auto.tries = 0; return; } // wait for the DOM to settle
+      if (now - seen.since < T(350)) return;
+
+      if (auto.key !== sig) {
+        if (doFill(dlg, q, choices, texts)) { auto.key = sig; auto.filledAt = now; auto.submitted = false; }
+        return;
+      }
+      // make sure the page really registered every selection before submitting; fix up if not
+      if (choices.length && !auto.submitted && !choicesMatch(q, choices)) {
+        if (auto.tries < 3) { auto.tries++; auto.key = null; return; }
+        warnOnce('could not select the right options for Q' + q.id + ', not submitting');
+        return;
+      }
+      if (autoSubmit && !auto.submitted && now - auto.filledAt > T(400)) trySubmit(dlg);
+    }
+
+    // The check loop runs every 100 ms so turbo can react quickly; the thresholds above set the real waits.
+    setInterval(function () { try { autoTick(); } catch (e) { warnOnce('error: ' + e.message); } }, 100);
+
+    // show the panel as soon as the body exists
+    function boot() { ensureUI(); render(); }
+    if (document.body) boot();
+    else document.addEventListener('DOMContentLoaded', boot);
+
+    // SPA safety: re-attach panel if the app wipes it
+    setInterval(function () {
+      if (ui && document.body && !document.body.contains(ui.box)) { ui = null; render(); }
+    }, 2000);
+  }
+
+  var s = document.createElement('script');
+  s.textContent = '(' + main.toString() + ')();';
+  (document.head || document.documentElement).appendChild(s);
+  s.remove();
+})();
