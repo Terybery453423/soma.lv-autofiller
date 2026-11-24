@@ -2,6 +2,8 @@
 
 A Tampermonkey userscript for [app.soma.lv](https://app.soma.lv) that shows the correct answers for the quiz question on screen in a small draggable panel, and can optionally fill in and submit answers automatically.
 
+Find the script [here](https://github.com/Terybery453423/soma.lv-autofiller/blob/main/the%20script) 
+
 > **Use responsibly.** Auto-answering graded or homework quizzes may break your school's or teacher's rules. Use this to check your understanding, to study, or on practice quizzes where it's allowed. You are responsible for how you use it.
 
 ## Features
